@@ -715,6 +715,190 @@ mod test {
         }
     }
 
+    // ── creator-earnings integration ────────────────────────────────────────
+    //
+    // Test-consumer pattern: drive `creator-earnings` exclusively through its
+    // public `CreatorEarningsClient` interface.  Mirrors how any external
+    // contract (e.g. subscription or treasury) would interact with it in
+    // production.
+
+    mod creator_earnings_integration {
+        use creator_earnings::{CreatorEarnings, CreatorEarningsClient, Error as EarningsError};
+        use soroban_sdk::{
+            testutils::Address as _,
+            token::{StellarAssetClient, TokenClient},
+            Address, Env,
+        };
+
+        fn setup(
+            env: &Env,
+        ) -> (
+            CreatorEarningsClient<'_>,
+            Address, // admin
+            Address, // depositor
+            Address, // creator
+            TokenClient<'_>,
+        ) {
+            env.mock_all_auths();
+            let admin = Address::generate(env);
+            let depositor = Address::generate(env);
+            let creator = Address::generate(env);
+
+            let token_addr = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+            let sac = StellarAssetClient::new(env, &token_addr);
+            sac.mint(&depositor, &10_000);
+
+            let id = env.register_contract(None, CreatorEarnings);
+            let client = CreatorEarningsClient::new(env, &id);
+            client.initialize(&admin, &token_addr);
+            client.add_authorized(&depositor);
+
+            (client, admin, depositor, creator, TokenClient::new(env, &token_addr))
+        }
+
+        /// Deposit increases creator balance and moves tokens into the contract.
+        #[test]
+        fn deposit_increases_balance_and_custody() {
+            let env = Env::default();
+            let (client, _, depositor, creator, token) = setup(&env);
+
+            client.deposit(&depositor, &creator, &1_000);
+
+            assert_eq!(client.balance(&creator), 1_000);
+            assert_eq!(token.balance(&client.address), 1_000);
+            assert_eq!(token.balance(&depositor), 9_000);
+        }
+
+        /// Multiple deposits from the same depositor accumulate correctly.
+        #[test]
+        fn multiple_deposits_accumulate() {
+            let env = Env::default();
+            let (client, _, depositor, creator, token) = setup(&env);
+
+            client.deposit(&depositor, &creator, &400);
+            client.deposit(&depositor, &creator, &600);
+
+            assert_eq!(client.balance(&creator), 1_000);
+            assert_eq!(token.balance(&client.address), 1_000);
+        }
+
+        /// Withdraw transfers tokens to creator and reduces recorded balance.
+        #[test]
+        fn withdraw_transfers_tokens_to_creator() {
+            let env = Env::default();
+            let (client, _, depositor, creator, token) = setup(&env);
+
+            client.deposit(&depositor, &creator, &1_000);
+            client.withdraw(&creator, &300);
+
+            assert_eq!(client.balance(&creator), 700);
+            assert_eq!(token.balance(&creator), 300);
+            assert_eq!(token.balance(&client.address), 700);
+        }
+
+        /// Withdrawing more than the balance returns InsufficientBalance.
+        #[test]
+        fn withdraw_overdraft_returns_error() {
+            let env = Env::default();
+            let (client, _, depositor, creator, _) = setup(&env);
+
+            client.deposit(&depositor, &creator, &500);
+
+            let result = client.try_withdraw(&creator, &501);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    EarningsError::InsufficientBalance as u32,
+                ))),
+                "overdraft must return InsufficientBalance"
+            );
+            assert_eq!(client.balance(&creator), 500, "balance must be unchanged");
+        }
+
+        /// Deposit from an address that was never authorized returns NotAuthorized.
+        #[test]
+        fn unauthorized_depositor_returns_error() {
+            let env = Env::default();
+            let (client, _, _, creator, _) = setup(&env);
+
+            let stranger = Address::generate(&env);
+            let result = client.try_deposit(&stranger, &creator, &100);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    EarningsError::NotAuthorized as u32,
+                ))),
+                "unauthorized depositor must return NotAuthorized"
+            );
+        }
+
+        /// Zero-amount deposit is rejected with InvalidAmount.
+        #[test]
+        fn zero_deposit_returns_invalid_amount() {
+            let env = Env::default();
+            let (client, _, depositor, creator, _) = setup(&env);
+
+            let result = client.try_deposit(&depositor, &creator, &0);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    EarningsError::InvalidAmount as u32,
+                ))),
+                "zero deposit must return InvalidAmount"
+            );
+        }
+
+        /// Zero-amount withdrawal is rejected with InvalidAmount.
+        #[test]
+        fn zero_withdraw_returns_invalid_amount() {
+            let env = Env::default();
+            let (client, _, depositor, creator, _) = setup(&env);
+
+            client.deposit(&depositor, &creator, &500);
+
+            let result = client.try_withdraw(&creator, &0);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    EarningsError::InvalidAmount as u32,
+                ))),
+                "zero withdrawal must return InvalidAmount"
+            );
+        }
+
+        /// Second initialize call is rejected with AlreadyInitialized.
+        #[test]
+        fn double_initialize_returns_error() {
+            let env = Env::default();
+            let (client, admin, _, _, token) = setup(&env);
+
+            let result = client.try_initialize(&admin, &token.address);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    EarningsError::AlreadyInitialized as u32,
+                ))),
+                "second initialize must return AlreadyInitialized"
+            );
+        }
+
+        /// Admin can also deposit directly (admin is implicitly authorized).
+        #[test]
+        fn admin_can_deposit_directly() {
+            let env = Env::default();
+            let (client, admin, _, creator, token) = setup(&env);
+
+            // Mint tokens to admin so they can deposit
+            let sac = StellarAssetClient::new(&env, &token.address);
+            sac.mint(&admin, &2_000);
+
+            client.deposit(&admin, &creator, &2_000);
+            assert_eq!(client.balance(&creator), 2_000);
+        }
+    }
+
     // ── treasury integration (Issue #907) ─────────────────────────────────
     //
     // Test-consumer pattern: drive `treasury` exclusively through its public
